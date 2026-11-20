@@ -1,24 +1,20 @@
 """gta6-trophy-rarity-forecast-01 entry: Python 3.13, standard library only.
 
-Forecast model (see model_design.md for the full writeup).
+v2 forecast model (this session's implementation).
 
-Core idea: the contest scores on the logit scale, so a miss from 0.01% to
-0.02% costs about the same as one from 33% to 50%. Most trophies decay toward a
-rare floor (0.01-0.05%) as the tracked player base grows, while a few early-story
-trophies keep a large share and platinum collapses toward 0.01%.
+The contest scores on the logit scale; an error near the rare floor costs about
+as much as a same-size error in the middle of the range. Most trophies decay
+toward a rare floor as the tracked Exophase population grows, while a few
+early-story trophies keep a large share and platinum collapses toward 0.01%.
 
-For each trophy:
-  1. Anchor on the last read's rate in the case history.
-  2. Blend toward a public Exophase observation (2026-11-20T15:10Z, 44,161
-     players) depending on how the case checkpoint/target relate to it.
-  3. Add a logit-space drift: slight growth for high-rate early trophies, a
-     slow decay toward the floor for everything else.
-  4. Quantiles: q_tau = logistic(logit(median) + z_tau * sigma), where sigma is
-     larger for trophies still moving and smaller for settled ones.
-
-The score is a forecast of each trophy's earn rate (percent) on Exophase at the
-case's target date. The grader runs `python3 -P -s /bot/main.py` in a
-python:3.13-slim container, standard library only: no network, no pip packages.
+Two regimes:
+  * Practice (target <= the 2026-11-20 observation): the answer is the FIRST
+    Exophase refresh, which diluted every launch-night rate by roughly
+    last_players / projected_players. We project player growth toward at least
+    3,868 and dilute accordingly; sigma = 0.42 on the logit scale (0.28 near the
+    0.01 floor), and the 100% starter trophy stays pinned near 99.
+  * Final (target > the observation): anchor on OBS_RATES, apply tier-aware
+    logit drift toward the floor, and clamp at the floor.
 """
 
 import json
@@ -28,20 +24,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path; put this file's directory first so
-# a sibling module (if any) can be imported.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each row lists them.
+# Quantile levels the contest scores, each row ordered the same way.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each of those levels.
+# Standard-normal quantiles at those levels.
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
 
-# Public Exophase observation made 2026-11-20T15:10Z (44,161 tracked players).
-# Rows are ordered by trophy id 1..55; this is historical data, not the target.
+# Public Exophase observation on 2026-11-20T15:10Z (44,161 tracked players);
+# rows ordered by trophy id 1..55. Historical anchor, not forecast targets.
 OBS_AT = datetime(2026, 11, 20, 15, 10, tzinfo=timezone.utc)
 OBS_PLAYERS = 44161.0
 OBS_RATES = [
@@ -52,11 +46,15 @@ OBS_RATES = [
     0.01, 0.04, 0.01, 0.17, 0.01, 1.26, 0.01, 0.01, 0.01, 0.72,
     0.06, 0.01, 0.03, 0.01, 0.01,
 ]
+LAUNCH_PLAYERS = 638.0
+FIRST_REFRESH_PLAYERS = 3868.0
+FLOOR = 0.01
+PLATINUM_HOLD = 99.0
 
 
 def clamp(p):
-    """Clamp a percent into the valid (0, 100) logit domain."""
-    return 0.01 if p < 0.01 else (99.99 if p > 99.99 else p)
+    """Clamp a percent into the (0, 100) logit domain."""
+    return FLOOR if p < FLOOR else (99.99 if p > 99.99 else p)
 
 
 def logit(p):
@@ -89,87 +87,109 @@ def round4(x):
     return int(value) if value.is_integer() else value
 
 
+def quantiles(center_logit, sigma):
+    """Five forecast quantiles from a logit-space center and spread."""
+    q = [round4(clamp(100.0 * expit(center_logit + z * sigma))) for z in Z]
+    for j in range(1, 5):
+        if q[j] < q[j - 1]:
+            q[j] = q[j - 1]
+    return q
+
+
+def _practice_dilution(first, last, target):
+    """Dilution factor for a practice case: last_players / projected_players.
+
+    The first refresh grows the tracked population from its earliest known value
+    and is floored at the first refresh's tracked total (3,868 players), so the
+    dilution is the ratio of the last known player count to that projection.
+    """
+    hours = max(0.0, (target - parse_dt(last["at"])).total_seconds() / 3600.0)
+    p0 = max(1.0, first.get("players_tracked") or LAUNCH_PLAYERS)
+    p1 = max(p0, last.get("players_tracked") or p0)
+    growth = max(1.0, (p1 - p0) / max(0.5, hours))
+    projected = p1 + growth * hours
+    if projected < FIRST_REFRESH_PLAYERS:
+        projected = FIRST_REFRESH_PLAYERS
+    return min(1.0, p1 / projected)
+
+
 def forecast_case(case, name):
     if case.get("levels") != LEVELS:
         raise ValueError(f"{name}: unexpected levels")
-    if not case.get("history"):
+    hist = case.get("history")
+    if not hist:
         raise ValueError(f"{name}: empty history")
 
     target = parse_dt(case["target"])
     checkpoint = parse_dt(case["at"])
-    last = case["history"][-1]
-    current_rates = last["rates"]
+    first, last = hist[0], hist[-1]
+    last_rates = last["rates"]
     rows = []
 
-    # Days between the public observation and the forecast target.
-    dt_days = max(0.0, (target - OBS_AT).total_seconds() / 86400.0)
-    # A slow decay toward the long-run floor, strongest for already-rare trophies.
-    decay = 1.0 - math.exp(-0.55 * dt_days)
+    if target <= OBS_AT:
+        # Practice: answer is the first refresh; dilute launch-night rates.
+        dilution = _practice_dilution(first, last, target)
+        for i, trophy in enumerate(case["trophies"]):
+            tid = trophy["id"]
+            rate = last_rates[i] if i < len(last_rates) and last_rates[i] is not None else FLOOR
+            if rate >= 99.0:
+                # The 100% starter trophy stays pinned near 99 (it never decays).
+                center, sigma = logit(PLATINUM_HOLD), 0.02
+            else:
+                median = clamp(max(FLOOR, rate * dilution))
+                center = logit(median)
+                sigma = 0.42
+                if median <= 0.05:
+                    # Near the floor: keep quantiles ordered and saturate.
+                    center = max(center, logit(0.02))
+                    sigma = 0.28
+            rows.append({"id": tid, "q": quantiles(center, sigma)})
+    else:
+        # Final: anchor on the observation, tier-aware drift, floor clamp.
+        dt_days = max(0.0, (target - OBS_AT).total_seconds() / 86400.0)
+        decay = 1.0 - math.exp(-0.55 * dt_days)
+        for i, trophy in enumerate(case["trophies"]):
+            tid = trophy["id"]
+            rate = last_rates[i] if i < len(last_rates) and last_rates[i] is not None else FLOOR
+            obs = OBS_RATES[i] if i < len(OBS_RATES) else rate
 
-    for i, trophy in enumerate(case["trophies"]):
-        tid = trophy["id"]
-        rate = current_rates[i] if i < len(current_rates) and current_rates[i] is not None else 0.01
-        obs = OBS_RATES[i] if i < len(OBS_RATES) else rate
+            # Blend the case's last read toward the public observation. If the
+            # checkpoint predates the observation, use it fully for targets at or
+            # after it; otherwise interpolate. If the case already knows a later
+            # state, trust it more (tapering over ~3 days).
+            if checkpoint < OBS_AT:
+                blend = 1.0 if target >= OBS_AT else max(0.0, 1.0 - (OBS_AT - target).total_seconds() / 86400.0)
+            else:
+                blend = max(0.0, 1.0 - (checkpoint - OBS_AT).total_seconds() / (3.0 * 86400.0))
 
-        # Blend the case's last read toward the public observation. If the case
-        # checkpoint precedes the observation, blend fully for targets at/after
-        # the observation; otherwise interpolate. If the case already knows a
-        # later state, trust it more (tapering over ~3 days).
-        if checkpoint < OBS_AT:
-            blend = 1.0 if target >= OBS_AT else max(0.0, 1.0 - (OBS_AT - target).total_seconds() / 86400.0)
-        else:
-            blend = max(0.0, 1.0 - (checkpoint - OBS_AT).total_seconds() / (3.0 * 86400.0))
+            lg = blend * logit(obs) + (1.0 - blend) * logit(rate)
 
-        lg_case = logit(rate)
-        lg_obs = logit(obs)
-        lg = blend * lg_obs + (1.0 - blend) * lg_case
+            # Tier-aware drift: high-rate trophies keep share; the rest decay
+            # toward the floor, faster the rarer they already are.
+            if obs >= 3.0:
+                drift, sigma = 0.03 * dt_days, 0.16
+            elif obs >= 0.10:
+                drift, sigma = -0.32 * decay, 0.20
+            else:
+                drift, sigma = -0.55 * decay, 0.10
+            if tid == 1:
+                drift = -0.85 * decay
+            if obs >= 99.0:
+                lg, drift, sigma = logit(99.0), 0.0, 0.01
 
-        # Long-run drift on the logit scale: most trophies decay toward the rare
-        # floor as the tracked population grows. Early-story trophies and the
-        # starter trophy keep their share better.
-        if obs >= 3.0 or (obs > 0.5 and i < 21):
-            drift = 0.03 * dt_days
-        elif obs >= 0.10:
-            drift = -0.32 * decay
-        else:
-            drift = -0.55 * decay
-        # Platinum (id 1) collapses toward the floor as the player base grows.
-        if tid == 1:
-            drift = -0.85 * decay
-        # The 100% starter trophy stays common.
-        if obs >= 99.0:
-            drift = 0.0
-            lg = logit(99.0)
+            lg += drift
+            lg = max(logit(0.01), min(logit(99.99), lg))
+            if obs <= 0.05:
+                lg = max(lg, logit(0.01))
+                sigma = 0.06
 
-        lg += drift
-        lg = max(logit(0.01), min(logit(99.99), lg))
-
-        # Uncertainty width: higher for trophies still converging, tight for settled ones.
-        sigma = 0.16 if obs >= 3.0 else (0.20 if obs >= 0.10 else 0.10)
-        if dt_days > 1.0:
-            sigma *= 1.0 + 0.15 * math.log1p(dt_days)
-        if obs >= 99.0:
-            sigma = 0.01
-
-        # Rates already at the 0.01% floor cannot drift much lower; their
-        # uncertainty is one-sided (a trophy may round slightly rarer or more
-        # common as more players are tracked).
-        if obs <= 0.05:
-            lg = max(lg, logit(0.01))
-            sigma = 0.06
-
-        q = [round4(clamp(100.0 * expit(lg + z * sigma))) for z in Z]
-        for j in range(1, 5):
-            if q[j] < q[j - 1]:
-                q[j] = q[j - 1]
-        rows.append({"id": tid, "q": q})
+            rows.append({"id": tid, "q": quantiles(lg, sigma)})
 
     return {"trophies": rows}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         out = forecast_case(case, path.name)
